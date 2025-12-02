@@ -345,7 +345,7 @@ Tab-separated values (TSV) file with:
 
 **Example structure:**
 
-see (declan93/TabALT)[https://github.com/declan93/TabALT] for details on generating relevant batch corrected telomere features.
+see [declan93/TabALT](https://github.com/declan93/TabALT) for details on generating relevant batch corrected telomere features.
 ```
 ALT     TelSeq    TelFusDetector_rate    AAAGGG    AACGGG    ...
 1       0.453     0.0012                 0.234     0.156     ...
