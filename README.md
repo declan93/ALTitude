@@ -344,6 +344,8 @@ Tab-separated values (TSV) file with:
 | Features | Numeric | Telomere metrics, expression values, etc. |
 
 **Example structure:**
+
+see (declan93/TabALT)[https://github.com/declan93/TabALT] for details on generating relevant batch corrected telomere features.
 ```
 ALT     TelSeq    TelFusDetector_rate    AAAGGG    AACGGG    ...
 1       0.453     0.0012                 0.234     0.156     ...
@@ -577,7 +579,7 @@ If you use ALTtitude in your research, please cite:
 
 ## License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+This project is licensed under the XXX License - see the [LICENSE](LICENSE) file for details.
 
 ---
 
@@ -593,8 +595,3 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 
 ---
 
-## Support
-
-For questions and support:
-- Open an issue on GitHub
-- Contact: [your-email@example.com]
