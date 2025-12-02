@@ -477,7 +477,7 @@ python ALTitude_cli.py predict new_samples.tsv \
     --output-file predictions.csv
 ```
 
-### Example 2: Optimized for Clinical Use
+### Example 2: Optimized for Increased Sensitivity
 
 ```bash
 # Train with high sensitivity (minimize missed ALT cases)
@@ -554,7 +554,6 @@ ALTtitude/
 ├── altitude_results_logger.py     # Results logging
 ├── altitude_prediction_logger.py  # Prediction logging
 ├── simple_visualizer.py           # Visualization
-├── addATRX.py                     # Feature engineering utility
 ├── README.md                      # This file
 └── requirements.txt               # Dependencies
 ```
@@ -567,9 +566,9 @@ If you use ALTtitude in your research, please cite:
 
 ```bibtex
 @software{altitude2024,
-  title={ALTtitude: A Machine Learning Pipeline for Predicting Alternative Lengthening of Telomeres},
+  title={Title},
   author={[Author Names]},
-  year={2024},
+  year={},
   url={https://github.com/yourusername/ALTtitude}
 }
 ```
