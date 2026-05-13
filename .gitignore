@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+
+# CatBoost runtime artifacts
+catboost_info/
+
+# Editor / IDE / agent local config
+.claude/
+.idea/
+.vscode/
+
+# macOS
+.DS_Store
+
+# ALTitude run outputs (don't commit trained models or run-specific results)
+results/
+test/results/
+test/fake_alt_input.tsv

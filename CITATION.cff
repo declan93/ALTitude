@@ -1,0 +1,26 @@
+cff-version: 1.2.0
+message: "If you use ALTitude in your research, please cite it as below."
+title: "ALTitude: A Machine Learning Pipeline for Predicting Alternative Lengthening of Telomeres in Cancer"
+authors:
+  - family-names: Bennett
+    given-names: Declan
+    email: declanbennett@hotmail.com
+repository-code: "https://github.com/declan93/ALTitude"
+license: MIT
+type: software
+keywords:
+  - alternative lengthening of telomeres
+  - ALT
+  - telomere biology
+  - cancer genomics
+  - machine learning
+  - ensemble stacking
+  - whole genome sequencing
+preferred-citation:
+  type: article
+  title: "TODO: paper title"
+  authors:
+    - family-names: Bennett
+      given-names: Declan
+  journal: "TODO: journal"
+  year: 2026

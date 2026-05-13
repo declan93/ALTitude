@@ -543,6 +543,24 @@ visualizer.plot_confusion_matrices(results, threshold=optimal['threshold'])
 
 ---
 
+## Synthetic Test Data
+
+The `test/` directory contains a synthetic dataset for sanity-checking the pipeline without real patient data.
+
+- **`test_data.txt`** — 100 simulated samples, comma-separated, matching the 60-column schema of the WDL pipeline's `complete_data_normalized` output (8 metadata cols + `TelSeq`, `TelFusDetector_rate`, `TelFuse_newtelomere`, and 49 TVR features). Values are z-scored. Feature distributions were calibrated against a real training cohort: a hidden 50/50 ALT label vector is drawn (seed 42), and each feature is sampled from a per-class Normal whose mean/sd was measured on real ALT+ vs ALT− samples. Cross-feature correlations are not modelled. The ALT label is not stored in the file.
+- **`prepare_fake_data.py`** — reproduces the same label vector deterministically (same seed, same construction) and writes `test/fake_alt_input.tsv` with the `ALT` column prepended, in the tab-separated format ALTitude expects.
+
+Run the smoke test:
+
+```bash
+python test/prepare_fake_data.py
+python ALTitude_cli.py train test/fake_alt_input.tsv --output-dir ./test/results --loo-cv
+```
+
+Because the injected class signal is strong by design, base models recover it almost perfectly (LOO-CV AUC ≈ 1.0). Use this dataset to verify that the pipeline runs end-to-end and to inspect output structure — it is not a substitute for evaluation on real data, since the synthetic features lack the correlation structure and noise of biological samples.
+
+---
+
 ## File Structure
 
 ```
@@ -557,7 +575,10 @@ ALTtitude/
 ├── altitude_prediction_logger.py  # Prediction logging
 ├── simple_visualizer.py           # Visualization
 ├── README.md                      # This file
-└── requirements.txt               # Dependencies
+├── requirements.txt               # Dependencies
+└── test/
+    ├── test_data.txt              # Synthetic 100-sample input (WDL schema)
+    └── prepare_fake_data.py       # Attaches reproducible ALT labels, writes TSV
 ```
 
 ---
@@ -579,7 +600,7 @@ If you use ALTtitude in your research, please cite:
 
 ## License
 
-This project is licensed under the XXX License - see the [LICENSE](LICENSE) file for details.
+This project is licensed under the MIT License — see the [LICENSE](LICENSE) file for details.
 
 ---
 
