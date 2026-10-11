@@ -20,13 +20,17 @@ class ModelManager:
         self.model_dir = Path(model_dir)
         self.model_dir.mkdir(exist_ok=True, parents=True)
         
-        # Define file paths - INCLUDING data_imputer
+        # Define file paths - INCLUDING data_imputer and deployment models
         self.paths = {
             'base_models': self.model_dir / "base_models.pkl",
             'meta_learners': self.model_dir / "meta_learners.pkl",
             'data_imputer': self.model_dir / "data_imputer.pkl",  # Added
             'data_scaler': self.model_dir / "data_scaler.pkl",
             'meta_scaler': self.model_dir / "meta_scaler.pkl",
+            # Deployment models (trained on ALL data)
+            'deployment_models': self.model_dir / "deployment_models.pkl",
+            'deployment_meta_learners': self.model_dir / "deployment_meta_learners.pkl",
+            'deployment_imputer': self.model_dir / "deployment_imputer.pkl",
             'config': self.model_dir / "config.json",
             'model_info': self.model_dir / "model_info.json",
             'summary': self.model_dir / "model_summary.csv",
@@ -36,11 +40,29 @@ class ModelManager:
     def save_training_state(self, fitted_models: List, meta_learners: Dict,
                            data_imputer: Any, data_scaler: Any, meta_scaler: Any,
                            selected_models: List[str], selected_indices: List[int],
-                           config: Config, model_summary: pd.DataFrame) -> bool:
-        """Save complete training state to disk"""
-        
+                           config: Config, model_summary: pd.DataFrame,
+                           deployment_models: Optional[List] = None,
+                           deployment_meta_learners: Optional[Dict] = None,
+                           deployment_imputer: Any = None) -> bool:
+        """Save complete training state to disk
+
+        Args:
+            fitted_models: Base models trained on training set (for evaluation)
+            meta_learners: Meta-learners trained on training set
+            data_imputer: Imputer fitted on training set
+            data_scaler: Scaler (kept for compatibility)
+            meta_scaler: Meta scaler
+            selected_models: Names of selected models for ensemble
+            selected_indices: Indices of selected models
+            config: Training configuration
+            model_summary: DataFrame with model performance summary
+            deployment_models: Optional base models trained on ALL data (train+test)
+            deployment_meta_learners: Optional meta-learners trained on ALL data
+            deployment_imputer: Optional imputer fitted on ALL data
+        """
+
         logging.info("Saving training state...")
-        
+
         try:
             # Save models and preprocessing objects
             components = {
@@ -50,7 +72,7 @@ class ModelManager:
                 'data_scaler': data_scaler,     # Keep for compatibility
                 'meta_scaler': meta_scaler
             }
-            
+
             for name, component in components.items():
                 if component is not None:
                     path = self.paths.get(name, self.model_dir / f"{name}.pkl")
@@ -59,17 +81,36 @@ class ModelManager:
                     logging.info(f"✅ {name} saved")
                 else:
                     logging.warning(f"⚠️ {name} is None, skipping")
-            
+
+            # Save deployment models if provided (trained on ALL data)
+            has_deployment = False
+            if deployment_models is not None and len(deployment_models) > 0:
+                with open(self.paths['deployment_models'], 'wb') as f:
+                    pickle.dump(deployment_models, f)
+                logging.info(f"✅ deployment_models saved ({len(deployment_models)} models trained on ALL data)")
+                has_deployment = True
+
+            if deployment_meta_learners is not None and len(deployment_meta_learners) > 0:
+                with open(self.paths['deployment_meta_learners'], 'wb') as f:
+                    pickle.dump(deployment_meta_learners, f)
+                logging.info(f"✅ deployment_meta_learners saved ({len(deployment_meta_learners)} meta-learners)")
+
+            if deployment_imputer is not None:
+                with open(self.paths['deployment_imputer'], 'wb') as f:
+                    pickle.dump(deployment_imputer, f)
+                logging.info("✅ deployment_imputer saved (fitted on ALL data)")
+
             # Save configuration
             config.to_file(str(self.paths['config']))
             logging.info("✅ Configuration saved")
-            
+
             # Save model selection info
             model_info = {
                 'selected_models': selected_models,
                 'selected_indices': selected_indices,
                 'n_base_models': len(fitted_models),
                 'n_meta_learners': len(meta_learners),
+                'has_deployment_models': has_deployment,
                 'timestamp': pd.Timestamp.now().isoformat(),
                 'best_model': model_summary.loc[model_summary['Mean ROC AUC'].idxmax(), 'Model'],
                 'best_auc': float(model_summary['Mean ROC AUC'].max())
@@ -155,7 +196,35 @@ class ModelManager:
             # Load summary
             state['model_summary'] = pd.read_csv(self.paths['summary'])
             logging.info("✅ Model summary loaded")
-            
+
+            # Load deployment models if they exist (trained on ALL data)
+            state['deployment_models'] = None
+            state['deployment_meta_learners'] = None
+            state['deployment_imputer'] = None
+
+            if self.paths['deployment_models'].exists():
+                with open(self.paths['deployment_models'], 'rb') as f:
+                    state['deployment_models'] = pickle.load(f)
+                logging.info(f"✅ deployment_models loaded ({len(state['deployment_models'])} models trained on ALL data)")
+
+            if self.paths['deployment_meta_learners'].exists():
+                with open(self.paths['deployment_meta_learners'], 'rb') as f:
+                    state['deployment_meta_learners'] = pickle.load(f)
+                logging.info(f"✅ deployment_meta_learners loaded")
+
+            if self.paths['deployment_imputer'].exists():
+                with open(self.paths['deployment_imputer'], 'rb') as f:
+                    state['deployment_imputer'] = pickle.load(f)
+                logging.info("✅ deployment_imputer loaded (fitted on ALL data)")
+
+            # Log deployment status
+            if state['deployment_models']:
+                logging.info("=" * 50)
+                logging.info("DEPLOYMENT MODELS AVAILABLE")
+                logging.info("These models were trained on 100% of data (train+test)")
+                logging.info("Use pipeline.load_state(state, use_deployment_models=True)")
+                logging.info("=" * 50)
+
             logging.info(f"✅ Training state loaded from: {self.model_dir}")
             return state
             

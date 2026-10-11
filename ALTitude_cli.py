@@ -95,6 +95,8 @@ Examples:
     
     train_parser.add_argument('--no-plots', action='store_true',
                              help='Skip visualization generation')
+    train_parser.add_argument('--refit-all-data', action='store_true',
+                             help='Refit final models on ALL data (train+test) for deployment')
     
     # Predict command
     predict_parser = subparsers.add_parser('predict', help='Make predictions')
@@ -176,6 +178,10 @@ def run_training(args):
             config_params['use_loo_cv'] = args.loo_cv
         if hasattr(args, 'loo_max_samples'):
             config_params['loo_max_samples'] = args.loo_max_samples
+
+        # Add refit on all data parameter
+        if hasattr(args, 'refit_all_data'):
+            config_params['refit_final_on_all_data'] = args.refit_all_data
 
         config = Config(**config_params)
 
@@ -374,7 +380,11 @@ def run_training(args):
         selected_models=results['selected_models'],
         selected_indices=results['selected_indices'],
         config=config,
-        model_summary=results['summary']
+        model_summary=results['summary'],
+        # Deployment models (trained on ALL data) - only if refit_final_on_all_data was True
+        deployment_models=results.get('deployment_models'),
+        deployment_meta_learners=results.get('deployment_meta_learners'),
+        deployment_imputer=results.get('deployment_imputer')
     )
 
     # Generate visualizations

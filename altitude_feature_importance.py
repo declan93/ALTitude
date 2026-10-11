@@ -1,210 +1,226 @@
 """
-Feature Importance Extractor for ALTitude Pipeline - Simplified version
+Feature Importance and SHAP Value Extractor for ALTitude Pipeline
+Extracts and saves feature importances from all trained models
 """
 
 import logging
-import json
-from pathlib import Path
-from typing import Dict, List, Optional, Any
 import numpy as np
 import pandas as pd
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple, Any
+import json
 
-# Optional SHAP support
+# Optional: SHAP support
 try:
     import shap
     SHAP_AVAILABLE = True
 except ImportError:
     SHAP_AVAILABLE = False
-    logging.info("SHAP not installed. Install with: pip install shap")
+    logging.warning("SHAP not installed. Install with: pip install shap")
 
 
 class FeatureImportanceExtractor:
-    """Extract and save feature importances from trained models"""
+    """Extract and save feature importances from all trained models"""
     
     def __init__(self, config):
         self.config = config
-        self.output_dir = config.output_dir / "feature_importances"
-        self.output_dir.mkdir(exist_ok=True, parents=True)
+        self.importances_dir = config.output_dir / "feature_importances"
+        self.importances_dir.mkdir(exist_ok=True, parents=True)
     
-    def extract_importances(self, models: List[tuple], feature_names: List[str]) -> Dict[str, Dict]:
+    def extract_all_importances(self, models_final: List[Tuple[str, Any]], 
+                               X_train: pd.DataFrame,
+                               X_train_scaled: np.ndarray) -> Dict[str, Dict]:
         """
         Extract feature importances from all models
         
-        Args:
-            models: List of (name, model) tuples
-            feature_names: List of feature names
-            
         Returns:
-            Dictionary with model names as keys and importance dicts as values
+            Dictionary with model names as keys and importance dictionaries as values
         """
         all_importances = {}
+        feature_names = list(X_train.columns)
         
-        for model_name, model in models:
+        for model_name, model in models_final:
             logging.info(f"Extracting importances for {model_name}...")
             
             try:
-                importances = self._get_model_importance(model, model_name, feature_names)
+                importances = self._extract_model_importance(
+                    model, model_name, feature_names, X_train, X_train_scaled
+                )
                 
                 if importances is not None:
                     all_importances[model_name] = importances
-                    logging.info(f"✅ Extracted {len(importances)} features for {model_name}")
+                    logging.info(f"✅ Extracted {len(importances)} feature importances for {model_name}")
                 else:
-                    logging.debug(f"No importances available for {model_name}")
+                    logging.warning(f"⚠️ No importances available for {model_name}")
                     
             except Exception as e:
-                logging.warning(f"Could not extract importances for {model_name}: {e}")
-                # Use uniform importance as fallback
-                all_importances[model_name] = {feat: 1.0/len(feature_names) 
-                                              for feat in feature_names}
+                logging.error(f"❌ Failed to extract importances for {model_name}: {e}")
+                all_importances[model_name] = {feat: 0.0 for feat in feature_names}
         
         return all_importances
     
-    def _get_model_importance(self, model: Any, model_name: str, 
-                             feature_names: List[str]) -> Optional[Dict[str, float]]:
+    def _extract_model_importance(self, model: Any, model_name: str, 
+                                 feature_names: List[str],
+                                 X_train: pd.DataFrame,
+                                 X_train_scaled: np.ndarray) -> Optional[Dict[str, float]]:
         """Extract importances from a single model"""
         
         # Handle pipeline models
         if hasattr(model, 'steps'):
-            # Get the last step from sklearn Pipeline
+            # It's a sklearn Pipeline, get the last step
             model = model.steps[-1][1]
         
-        # Tree-based models
+        # Tree-based models with feature_importances_
         if hasattr(model, 'feature_importances_'):
             importances = model.feature_importances_
+            # Convert to native Python floats
             return {feat: float(imp) for feat, imp in zip(feature_names, importances)}
         
-        # Linear models
+        # Linear models with coef_
         elif hasattr(model, 'coef_'):
-            coef = model.coef_
-            if coef.ndim > 1:
-                # Multi-class: use mean absolute coefficient
-                importances = np.mean(np.abs(coef), axis=0)
+            # Use absolute values of coefficients as importance
+            if model.coef_.ndim > 1:
+                # Multi-class or multi-output
+                importances = np.abs(model.coef_[0])
             else:
-                importances = np.abs(coef)
+                importances = np.abs(model.coef_)
+            # Convert to native Python floats
             return {feat: float(imp) for feat, imp in zip(feature_names, importances)}
         
-        # TabPFN or other models without native importance
-        elif 'TabPFN' in model_name or 'Naive' in model_name:
-            # Return None to indicate no native importance
-            return None
+        # TabPFN models - special handling
+        elif 'TabPFN' in model_name:
+            # TabPFN doesn't have native feature importance
+            # Could use permutation importance instead
+            logging.info(f"TabPFN model detected - using uniform importance as placeholder")
+            uniform_importance = 1.0 / len(feature_names)
+            return {feat: float(uniform_importance) for feat in feature_names}
         
         else:
-            logging.debug(f"Model {model_name} has no known importance attribute")
+            logging.warning(f"Model {model_name} has no known importance attribute")
             return None
     
-    def calculate_shap_values(self, models: List[tuple], X_sample: np.ndarray,
-                             feature_names: List[str], max_samples: int = 100) -> Dict[str, np.ndarray]:
+    def calculate_shap_values(self, models_final: List[Tuple[str, Any]], 
+                             X_train: pd.DataFrame,
+                             X_train_scaled: np.ndarray,
+                             y_train: pd.Series,
+                             max_samples: int = 1000) -> Dict[str, np.ndarray]:
         """
-        Calculate SHAP values for interpretable models only
+        Calculate SHAP values for all models
         
         Args:
-            models: List of (name, model) tuples
-            X_sample: Sample of training data
-            feature_names: List of feature names
-            max_samples: Maximum samples for SHAP calculation
+            max_samples: Maximum number of samples to use for SHAP calculation
             
         Returns:
-            Dictionary with model names as keys and SHAP arrays as values
+            Dictionary with model names as keys and SHAP value arrays as values
         """
         if not SHAP_AVAILABLE:
-            logging.info("SHAP not available")
+            logging.error("SHAP is not installed. Cannot calculate SHAP values.")
             return {}
         
-        shap_results = {}
+        all_shap_values = {}
         
         # Limit samples for performance
-        if len(X_sample) > max_samples:
-            indices = np.random.choice(len(X_sample), max_samples, replace=False)
-            X_sample = X_sample[indices]
+        if len(X_train) > max_samples:
+            sample_indices = np.random.choice(len(X_train), max_samples, replace=False)
+            X_sample = X_train.iloc[sample_indices]
+            X_scaled_sample = X_train_scaled[sample_indices]
+        else:
+            X_sample = X_train
+            X_scaled_sample = X_train_scaled
         
-        for model_name, model in models:
-            # Only calculate SHAP for tree-based models (fast)
-            if any(name in model_name for name in ['Forest', 'XGBoost', 'LightGBM', 'CatBoost']):
-                logging.info(f"Calculating SHAP values for {model_name}...")
+        for model_name, model in models_final:
+            logging.info(f"Calculating SHAP values for {model_name}...")
+            
+            try:
+                # Choose appropriate data based on model type
+                if 'TabPFN' in model_name:
+                    X_for_shap = X_sample.values
+                else:
+                    X_for_shap = X_scaled_sample
                 
-                try:
-                    # Handle pipeline
-                    if hasattr(model, 'steps'):
-                        model = model.steps[-1][1]
-                    
-                    # Create explainer
+                # Create appropriate explainer
+                if any(name in model_name for name in ['Forest', 'XGBoost', 'LightGBM', 'CatBoost']):
+                    # Tree-based model
                     explainer = shap.TreeExplainer(model)
-                    shap_values = explainer.shap_values(X_sample)
+                    shap_values = explainer.shap_values(X_for_shap)
                     
                     # Handle binary classification output
                     if isinstance(shap_values, list) and len(shap_values) == 2:
                         shap_values = shap_values[1]  # Use positive class
+                        
+                else:
+                    # Use KernelExplainer for other models
+                    explainer = shap.KernelExplainer(
+                        model.predict_proba if hasattr(model, 'predict_proba') else model.predict,
+                        shap.sample(X_for_shap, min(100, len(X_for_shap)))
+                    )
+                    shap_values = explainer.shap_values(X_for_shap)
                     
-                    shap_results[model_name] = shap_values
-                    logging.info(f"✅ SHAP values calculated for {model_name}")
-                    
-                except Exception as e:
-                    logging.warning(f"SHAP calculation failed for {model_name}: {e}")
+                    # Handle binary classification output
+                    if isinstance(shap_values, list) and len(shap_values) == 2:
+                        shap_values = shap_values[1]
+                
+                all_shap_values[model_name] = shap_values
+                logging.info(f"✅ Calculated SHAP values for {model_name}: shape {shap_values.shape}")
+                
+            except Exception as e:
+                logging.error(f"❌ Failed to calculate SHAP values for {model_name}: {e}")
         
-        return shap_results
+        return all_shap_values
     
-    def save_results(self, importances: Dict[str, Dict], 
-                    shap_values: Optional[Dict] = None) -> Dict[str, Path]:
-        """Save importance results to files"""
+    def save_importances_to_csv(self, all_importances: Dict[str, Dict], 
+                               filename: str = "feature_importances.csv"):
+        """Save feature importances to CSV file"""
         
-        saved_files = {}
+        # Convert to DataFrame, ensuring all values are native Python types
+        df_data = {}
+        for model_name, importances in all_importances.items():
+            df_data[model_name] = {k: float(v) for k, v in importances.items()}
         
-        # Save as CSV
-        if importances:
-            csv_path = self._save_csv(importances)
-            saved_files['csv'] = csv_path
+        df = pd.DataFrame(df_data)
         
-        # Save as JSON
-        if importances:
-            json_path = self._save_json(importances)
-            saved_files['json'] = json_path
-        
-        # Save SHAP values if available
-        if shap_values:
-            shap_path = self._save_shap(shap_values, list(next(iter(importances.values())).keys()))
-            saved_files['shap'] = shap_path
-        
-        # Create summary report
-        report_path = self._create_report(importances, shap_values)
-        saved_files['report'] = report_path
-        
-        return saved_files
-    
-    def _save_csv(self, importances: Dict[str, Dict]) -> Path:
-        """Save importances as CSV"""
-        
-        # Convert to DataFrame
-        df = pd.DataFrame(importances)
-        
-        # Add mean importance
+        # Sort by mean importance across all models
         df['mean_importance'] = df.mean(axis=1)
         df = df.sort_values('mean_importance', ascending=False)
         
-        # Add rank
+        # Add rank column
         df['rank'] = range(1, len(df) + 1)
         
         # Reorder columns
-        cols = ['rank', 'mean_importance'] + [col for col in df.columns 
-                                              if col not in ['rank', 'mean_importance']]
+        cols = ['rank', 'mean_importance'] + [col for col in df.columns if col not in ['rank', 'mean_importance']]
         df = df[cols]
         
-        # Save
-        csv_path = self.output_dir / "feature_importances.csv"
-        df.to_csv(csv_path, index_label='feature')
+        # Save to CSV
+        output_path = self.importances_dir / filename
+        df.to_csv(output_path, index_label='feature')
         
-        logging.info(f"✅ CSV saved to: {csv_path}")
-        return csv_path
+        logging.info(f"✅ Feature importances saved to: {output_path}")
+        return output_path
     
-    def _save_json(self, importances: Dict[str, Dict]) -> Path:
-        """Save importances as JSON with statistics"""
+    def save_importances_to_json(self, all_importances: Dict[str, Dict],
+                                filename: str = "feature_importances.json"):
+        """Save feature importances to JSON file"""
         
-        # Calculate statistics
-        features = list(next(iter(importances.values())).keys())
-        stats = {}
+        # Custom JSON encoder for numpy types
+        class NumpyEncoder(json.JSONEncoder):
+            def default(self, obj):
+                if isinstance(obj, np.integer):
+                    return int(obj)
+                elif isinstance(obj, np.floating):
+                    return float(obj)
+                elif isinstance(obj, np.ndarray):
+                    return obj.tolist()
+                elif isinstance(obj, np.bool_):
+                    return bool(obj)
+                return super().default(obj)
+        
+        # Calculate summary statistics
+        features = list(next(iter(all_importances.values())).keys())
+        summary_stats = {}
         
         for feature in features:
-            values = [imp.get(feature, 0) for imp in importances.values()]
-            stats[feature] = {
+            values = [importances.get(feature, 0) for importances in all_importances.values()]
+            summary_stats[feature] = {
                 'mean': float(np.mean(values)),
                 'std': float(np.std(values)),
                 'min': float(np.min(values)),
@@ -213,146 +229,214 @@ class FeatureImportanceExtractor:
             }
         
         # Create output structure
-        output = {
-            'model_importances': importances,
-            'feature_statistics': stats,
+        output_data = {
+            'model_importances': all_importances,
+            'summary_statistics': summary_stats,
             'metadata': {
-                'n_models': len(importances),
+                'n_models': len(all_importances),
                 'n_features': len(features),
                 'timestamp': pd.Timestamp.now().isoformat()
             }
         }
         
-        # Save
-        json_path = self.output_dir / "feature_importances.json"
-        with open(json_path, 'w') as f:
-            json.dump(output, f, indent=2, default=float)
+        # Save to JSON using custom encoder
+        output_path = self.importances_dir / filename
+        with open(output_path, 'w') as f:
+            json.dump(output_data, f, indent=2, cls=NumpyEncoder)
         
-        logging.info(f"✅ JSON saved to: {json_path}")
-        return json_path
+        logging.info(f"✅ Feature importances saved to: {output_path}")
+        return output_path
     
-    def _save_shap(self, shap_values: Dict[str, np.ndarray], 
-                   feature_names: List[str]) -> Path:
-        """Save SHAP values summary"""
+    def save_shap_values(self, all_shap_values: Dict[str, np.ndarray],
+                        feature_names: List[str],
+                        filename_prefix: str = "shap_values"):
+        """Save SHAP values to files"""
         
-        # Calculate mean absolute SHAP values
-        shap_summary = pd.DataFrame()
+        if not all_shap_values:
+            logging.warning("No SHAP values to save")
+            return
         
-        for model_name, values in shap_values.items():
-            mean_abs_shap = np.mean(np.abs(values), axis=0)
-            shap_summary[model_name] = mean_abs_shap
+        # Save mean absolute SHAP values as CSV
+        mean_shap_df = pd.DataFrame()
         
-        shap_summary.index = feature_names[:len(shap_summary)]
-        shap_summary['mean_shap'] = shap_summary.mean(axis=1)
-        shap_summary = shap_summary.sort_values('mean_shap', ascending=False)
+        for model_name, shap_values in all_shap_values.items():
+            mean_abs_shap = np.mean(np.abs(shap_values), axis=0)
+            mean_shap_df[model_name] = mean_abs_shap
         
-        # Save
-        shap_path = self.output_dir / "shap_summary.csv"
-        shap_summary.to_csv(shap_path, index_label='feature')
+        mean_shap_df.index = feature_names
+        mean_shap_df['mean_shap'] = mean_shap_df.mean(axis=1)
+        mean_shap_df = mean_shap_df.sort_values('mean_shap', ascending=False)
         
-        logging.info(f"✅ SHAP summary saved to: {shap_path}")
-        return shap_path
+        # Save to CSV
+        csv_path = self.importances_dir / f"{filename_prefix}_summary.csv"
+        mean_shap_df.to_csv(csv_path, index_label='feature')
+        
+        logging.info(f"✅ SHAP summary saved to: {csv_path}")
+        
+        # Save detailed SHAP values for each model as numpy arrays
+        for model_name, shap_values in all_shap_values.items():
+            npy_path = self.importances_dir / f"{filename_prefix}_{model_name.replace(' ', '_')}.npy"
+            np.save(npy_path, shap_values)
+            logging.info(f"✅ SHAP values for {model_name} saved to: {npy_path}")
+        
+        return csv_path
     
-    def _create_report(self, importances: Dict[str, Dict], 
-                      shap_values: Optional[Dict] = None) -> Path:
-        """Create text report of feature importances"""
+    def create_importance_report(self, all_importances: Dict[str, Dict],
+                                all_shap_values: Optional[Dict[str, np.ndarray]] = None,
+                                top_n: int = 20):
+        """Create a comprehensive importance report"""
         
-        report_path = self.output_dir / "importance_report.txt"
+        report_path = self.importances_dir / "importance_report.txt"
         
         with open(report_path, 'w') as f:
-            f.write("=" * 60 + "\n")
+            f.write("="*70 + "\n")
             f.write("FEATURE IMPORTANCE REPORT\n")
-            f.write("=" * 60 + "\n\n")
+            f.write("="*70 + "\n\n")
             f.write(f"Generated: {pd.Timestamp.now()}\n")
-            f.write(f"Models analyzed: {len(importances)}\n")
+            f.write(f"Number of models: {len(all_importances)}\n")
+            f.write(f"Number of features: {len(next(iter(all_importances.values())))}\n\n")
             
-            if importances:
-                features = list(next(iter(importances.values())).keys())
-                f.write(f"Features: {len(features)}\n\n")
-                
-                # Calculate mean importances
-                mean_imp = {}
-                for feature in features:
-                    values = [imp.get(feature, 0) for imp in importances.values()]
-                    mean_imp[feature] = np.mean(values)
-                
-                # Top features
-                f.write("TOP 20 FEATURES BY MEAN IMPORTANCE\n")
-                f.write("-" * 40 + "\n")
-                
-                sorted_features = sorted(mean_imp.items(), key=lambda x: x[1], reverse=True)
-                for i, (feature, importance) in enumerate(sorted_features[:20], 1):
-                    f.write(f"{i:3d}. {feature[:30]:30s} {importance:.6f}\n")
-                
-                # Model-specific top features
-                f.write("\n\nTOP 10 FEATURES BY MODEL\n")
-                f.write("=" * 60 + "\n")
-                
-                for model_name, imp in importances.items():
-                    f.write(f"\n{model_name}\n")
-                    f.write("-" * len(model_name) + "\n")
-                    
-                    sorted_imp = sorted(imp.items(), key=lambda x: x[1], reverse=True)
-                    for i, (feature, value) in enumerate(sorted_imp[:10], 1):
-                        f.write(f"{i:2d}. {feature[:30]:30s} {value:.6f}\n")
+            # Top features by mean importance
+            f.write("TOP FEATURES BY MEAN IMPORTANCE\n")
+            f.write("-"*50 + "\n")
             
-            if shap_values:
+            # Calculate mean importances
+            features = list(next(iter(all_importances.values())).keys())
+            mean_importances = {}
+            
+            for feature in features:
+                values = [imp.get(feature, 0) for imp in all_importances.values()]
+                mean_importances[feature] = np.mean(values)
+            
+            # Sort and display top features
+            sorted_features = sorted(mean_importances.items(), key=lambda x: x[1], reverse=True)
+            
+            for i, (feature, importance) in enumerate(sorted_features[:top_n], 1):
+                f.write(f"{i:3d}. {feature:30s} {importance:.6f}\n")
+            
+            # Model-specific top features
+            f.write("\n\nTOP 10 FEATURES BY MODEL\n")
+            f.write("="*70 + "\n")
+            
+            for model_name, importances in all_importances.items():
+                f.write(f"\n{model_name}\n")
+                f.write("-"*len(model_name) + "\n")
+                
+                sorted_imp = sorted(importances.items(), key=lambda x: x[1], reverse=True)
+                for i, (feature, imp) in enumerate(sorted_imp[:10], 1):
+                    f.write(f"{i:2d}. {feature:30s} {imp:.6f}\n")
+            
+            # SHAP values section if available
+            if all_shap_values:
                 f.write("\n\nSHAP VALUE ANALYSIS\n")
-                f.write("=" * 60 + "\n")
-                f.write(f"Models with SHAP values: {len(shap_values)}\n")
+                f.write("="*70 + "\n")
                 
-                for model_name in shap_values:
-                    f.write(f"  - {model_name}\n")
-            
-            f.write("\n" + "=" * 60 + "\n")
-            f.write("END OF REPORT\n")
+                for model_name, shap_values in all_shap_values.items():
+                    mean_abs_shap = np.mean(np.abs(shap_values), axis=0)
+                    top_shap_indices = np.argsort(mean_abs_shap)[-10:][::-1]
+                    
+                    f.write(f"\n{model_name} - Top 10 by SHAP\n")
+                    f.write("-"*len(model_name) + "\n")
+                    
+                    for i, idx in enumerate(top_shap_indices, 1):
+                        f.write(f"{i:2d}. {features[idx]:30s} {mean_abs_shap[idx]:.6f}\n")
         
-        logging.info(f"✅ Report saved to: {report_path}")
+        logging.info(f"✅ Importance report saved to: {report_path}")
         return report_path
 
 
-def integrate_with_ml_pipeline_configurable(pipeline, models_final, X_train, 
-                                           X_train_scaled, y_train,
-                                           calculate_shap=False, 
-                                           shap_max_samples=100):
+# METHOD 2: Add a parameter to control SHAP calculation
+def integrate_with_ml_pipeline_configurable(pipeline, models_final, X_train, X_train_scaled, y_train,
+                                            calculate_shap=False, shap_max_samples=500):
     """
-    Integrate feature importance extraction with ML pipeline
+    Integrate feature importance extraction with configurable SHAP
+
+    Args:
+        calculate_shap: Whether to calculate SHAP values (default: False)
+        shap_max_samples: Maximum samples for SHAP if enabled
+    """
+
+    extractor = FeatureImportanceExtractor(pipeline.config)
+
+    # Extract feature importances
+    logging.info("🎯 Extracting feature importances from all models...")
+    all_importances = extractor.extract_all_importances(models_final, X_train, X_train_scaled)
+
+    # Save importances
+    csv_path = extractor.save_importances_to_csv(all_importances)
+    json_path = extractor.save_importances_to_json(all_importances)
+
+    # Calculate SHAP values only if requested
+    all_shap_values = None
+    if calculate_shap and SHAP_AVAILABLE:
+        logging.info("🎯 Calculating SHAP values (this may take a while)...")
+        all_shap_values = extractor.calculate_shap_values(
+            models_final, X_train, X_train_scaled, y_train, max_samples=shap_max_samples
+        )
+
+        if all_shap_values:
+            extractor.save_shap_values(all_shap_values, list(X_train.columns))
+    else:
+        logging.info("ℹ️ SHAP calculations disabled")
+
+    # Create comprehensive report
+    report_path = extractor.create_importance_report(all_importances, all_shap_values)
+
+    logging.info("✅ Feature importance extraction complete!")
+    logging.info(f"📁 Results saved to: {extractor.importances_dir}")
+
+    return {
+        'importances': all_importances,
+        'shap_values': all_shap_values,
+        'csv_path': csv_path,
+        'json_path': json_path,
+        'report_path': report_path
+    }
+
+
+# Example usage function
+def extract_importances_from_saved_models(model_dir: Path, data_path: str):
+    """
+    Extract importances from already saved models
     
     Args:
-        pipeline: MLPipeline instance
-        models_final: List of trained models
-        X_train: Training data (DataFrame)
-        X_train_scaled: Scaled training data (array)
-        y_train: Training labels
-        calculate_shap: Whether to calculate SHAP values
-        shap_max_samples: Max samples for SHAP calculation
-        
-    Returns:
-        Dictionary with paths to saved files
+        model_dir: Directory containing saved models
+        data_path: Path to training data (needed for SHAP)
     """
+    from altitude_model_manager import ModelManager
+    from altitude_core import DataLoader, Config
     
-    extractor = FeatureImportanceExtractor(pipeline.config)
+    # Load saved models
+    model_manager = ModelManager(model_dir)
+    training_state = model_manager.load_training_state()
     
-    # Extract feature importances
-    logging.info("Extracting feature importances...")
-    importances = extractor.extract_importances(models_final, list(X_train.columns))
+    # Load training data
+    config = training_state['config']
+    data_loader = DataLoader(config)
+    X_train_scaled, _, X_train, _, y_train, _ = data_loader.load_and_split_data()
     
-    # Calculate SHAP values if requested
-    shap_values = None
-    if calculate_shap and SHAP_AVAILABLE:
-        logging.info("Calculating SHAP values...")
-        # Use appropriate data format for different models
-        shap_values = extractor.calculate_shap_values(
-            models_final, X_train_scaled, list(X_train.columns), shap_max_samples
-        )
+    # Extract importances
+    extractor = FeatureImportanceExtractor(config)
+    all_importances = extractor.extract_all_importances(
+        training_state['fitted_models'], X_train, X_train_scaled
+    )
     
     # Save results
-    saved_files = extractor.save_results(importances, shap_values)
+    extractor.save_importances_to_csv(all_importances)
+    extractor.save_importances_to_json(all_importances)
+    extractor.create_importance_report(all_importances)
     
-    logging.info("✅ Feature importance extraction complete")
-    
-    return {
-        'importances': importances,
-        'shap_values': shap_values,
-        **saved_files
-    }
+    return all_importances
+
+
+if __name__ == "__main__":
+    print("Feature Importance Extractor for ALTitude Pipeline")
+    print("="*50)
+    print("This module extracts and saves feature importances from all trained models")
+    print("\nFeatures:")
+    print("- Extract native feature importances from tree-based models")
+    print("- Extract coefficient-based importances from linear models")
+    print("- Calculate SHAP values for model-agnostic importance")
+    print("- Save results in multiple formats (CSV, JSON, NPY)")
+    print("- Generate comprehensive importance reports")
+    print("\nIntegrate with your pipeline by calling integrate_with_ml_pipeline()")

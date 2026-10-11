@@ -1,5 +1,136 @@
 """
-ALTitude Core - ML Pipeline with Leave-One-Out Cross-Validation
+ALTitude Core - Machine Learning Pipeline for ALT (Alternative Lengthening of Telomeres) Prediction
+
+This module implements a comprehensive machine learning pipeline for binary classification
+of ALT status in cancer samples. It supports multiple ML algorithms, ensemble methods,
+and flexible cross-validation strategies.
+
+Architecture Overview
+---------------------
+The pipeline follows a standard ML workflow:
+
+    1. Data Loading & Preprocessing (DataLoader)
+       - Load tab-separated data files
+       - Stratified train/test split (default 70/30)
+       - Imputation for models that don't handle NaN
+       - Class distribution verification
+
+    2. Model Training (ModelTrainer)
+       - Train multiple base models (XGBoost, CatBoost, LightGBM, etc.)
+       - Generate Out-of-Fold (OOF) predictions via cross-validation
+       - Support for k-fold CV or Leave-One-Out CV
+
+    3. Ensemble Creation (MLPipeline)
+       - Select top N models based on CV performance
+       - Train meta-learners (stacking ensemble) on OOF predictions
+       - Evaluate on held-out test set
+
+    4. Deployment Model Refitting (Optional)
+       - Refit all models on 100% of data (train + test) for deployment
+       - Separate from evaluation models to prevent data leakage in metrics
+
+Cross-Validation Strategy
+-------------------------
+Two CV strategies are supported:
+
+    - **k-fold CV** (default): Faster, suitable for larger datasets
+      - Configurable number of folds (default: 5)
+      - Generates OOF predictions for all training samples
+
+    - **Leave-One-Out CV**: More thorough, suitable for small datasets
+      - Each sample is held out once for validation
+      - Maximum sample limit to prevent excessive computation
+
+Model Types
+-----------
+Base models are categorized by their ability to handle missing values:
+
+    **NaN-native models** (use raw data):
+    - XGBoost
+    - CatBoost
+    - LightGBM
+    - HistGradientBoosting
+
+    **Imputation-required models** (use imputed data):
+    - Logistic Regression
+    - Random Forest
+    - ExtraTrees
+    - AdaBoost
+    - TabPFN (optional)
+
+Ensemble (Stacking)
+-------------------
+Meta-learners are trained on stacked OOF predictions from top base models:
+
+    - Logistic Regression
+    - Random Forest
+    - XGBoost
+
+The ensemble predictions are prefixed with "SE_" (Stacking Ensemble).
+
+Deployment vs Evaluation Models
+-------------------------------
+When `refit_final_on_all_data=True`:
+
+    - **Evaluation models**: Trained on training set only (e.g., 90%)
+      Used for test set evaluation and reported metrics
+
+    - **Deployment models**: Trained on ALL data (100%)
+      Used for predictions on new, unseen data
+
+This separation ensures reported metrics are unbiased while maximizing
+predictive performance for deployment.
+
+Usage Example
+-------------
+    >>> from altitude_core import MLPipeline, Config
+    >>>
+    >>> # Configure the pipeline
+    >>> config = Config(
+    ...     data_path="training_data.tsv",
+    ...     output_dir="./results",
+    ...     cv_folds=5,
+    ...     refit_final_on_all_data=True  # Enable deployment models
+    ... )
+    >>>
+    >>> # Train models
+    >>> pipeline = MLPipeline(config)
+    >>> results = pipeline.train()
+    >>>
+    >>> # Make predictions on new data
+    >>> pipeline.load_state(results, use_deployment_models=True)
+    >>> predictions = pipeline.predict("new_samples.tsv")
+
+CLI Usage
+---------
+    # Train with deployment models
+    $ python ALTitude_cli.py train data.tsv --refit-all-data
+
+    # Make predictions
+    $ python ALTitude_cli.py predict new_data.tsv --model-dir ./results/
+
+Output Files
+------------
+The pipeline generates several output files in the output directory:
+
+    - model_summary.csv: Performance summary for all models
+    - class_distribution.json: Train/test class proportions
+    - predictions/: OOF and test set predictions
+    - images/: Visualization plots (ROC, PR curves, etc.)
+    - *.pkl: Serialized model files
+
+Dependencies
+------------
+Required:
+    - numpy, pandas, scikit-learn
+    - xgboost, lightgbm, catboost
+    - torch (for seed management)
+
+Optional:
+    - tabpfn_extensions (TabPFN classifier)
+
+Author: ALTitude Development Team
+Version: 2.0
 """
 
 import gc
@@ -53,7 +184,90 @@ from altitude_feature_importance import integrate_with_ml_pipeline_configurable
 
 @dataclass
 class Config:
-    """Configuration class for the ML pipeline"""
+    """Configuration dataclass for the ALTitude ML pipeline.
+
+    This class holds all configuration parameters for training, evaluation,
+    and prediction. It supports serialization to/from JSON files for
+    reproducibility and experiment tracking.
+
+    Attributes
+    ----------
+
+    random_seed : int, default=32ac
+        Random seed for reproducibility across all libraries (numpy, torch, sklearn).
+
+    test_size : float, default=0.3
+        Proportion of data to hold out for testing (0.0 to 1.0).
+        The remaining data is used for training and cross-validation.
+
+    cv_folds : int, default=5
+        Number of folds for k-fold cross-validation.
+        Ignored if use_loo_cv is True.
+
+    n_top_models : int, default=5
+        Number of top-performing base models to select for the stacking ensemble.
+        Models are ranked by CV ROC-AUC score.
+
+    correlation_threshold : float, default=0.9
+        Threshold for feature correlation filtering (currently unused).
+
+    n_bootstraps : int, default=1000
+        Number of bootstrap iterations for confidence intervals (currently unused).
+
+    hyperparam_iterations : int, default=10
+        Number of iterations for hyperparameter optimization (currently unused).
+
+    use_loo_cv : bool, default=False
+        If True, use Leave-One-Out cross-validation instead of k-fold CV.
+        Recommended for small datasets (< 500 samples) for more robust estimates.
+
+    loo_max_samples : int, default=500
+        Maximum number of samples for LOO CV. If dataset exceeds this,
+        falls back to k-fold CV to avoid excessive computation time.
+
+    use_feature_selection : bool, default=False
+        If True, perform feature selection before training (currently unused).
+
+    n_features_to_select : int, default=20
+        Number of features to select if feature selection is enabled.
+
+    data_path : str, default=''
+        Path to the training data file (tab-separated format).
+
+    unseen_path : str, default=''
+        Path to unseen/external validation data (optional).
+
+    output_dir : Path, default=Path("./results")
+        Directory for saving all output files (models, predictions, plots).
+
+    output_dir_image : Path, default=Path("./results/images")
+        Directory for saving visualization plots.
+
+    tabpfn_max_time : int, default=40
+        Maximum time (seconds) for TabPFN model inference.
+
+    refit_final_on_all_data : bool, default=False
+        If True, refit all models on 100% of data (train + test) after
+        evaluation for deployment. This creates separate "deployment models"
+        while preserving unbiased test metrics from evaluation models.
+
+    Example
+    -------
+    >>> # Create config programmatically
+    >>> config = Config(
+    ...     data_path="data/training.tsv",
+    ...     test_size=0.3,
+    ...     cv_folds=5,
+    ...     refit_final_on_all_data=True
+    ... )
+    >>>
+    >>> # Save to file
+    >>> config.to_file("config.json")
+    >>>
+    >>> # Load from file
+    >>> config = Config.from_file("config.json")
+    """
+
     random_seed: int = 32
     test_size: float = 0.3
     cv_folds: int = 5
@@ -61,11 +275,11 @@ class Config:
     correlation_threshold: float = 0.9
     n_bootstraps: int = 1000
     hyperparam_iterations: int = 10
-    
+
     # LOO CV parameters (replacing nested CV)
-    use_loo_cv: bool = False  # Use Leave-One-Out CV instead of k-fold
+    use_loo_cv: bool = False
     loo_max_samples: int = 500
-    
+
     # Feature selection (not used in simplified version but accepted for compatibility)
     use_feature_selection: bool = False
     n_features_to_select: int = 20
@@ -75,25 +289,57 @@ class Config:
     unseen_path: str = ''
     output_dir: Path = Path("./results")
     output_dir_image: Path = Path("./results/images")
-    
+
     # TabPFN settings
     tabpfn_max_time: int = 40
 
+    # Final model refitting - refit on ALL data (train+test) for deployment
+    refit_final_on_all_data: bool = False
+
     def __post_init__(self):
+        """Initialize paths and create output directories."""
         self.output_dir = Path(self.output_dir)
         self.output_dir.mkdir(exist_ok=True, parents=True)
         self.output_dir_image = Path(self.output_dir_image)
         self.output_dir_image.mkdir(exist_ok=True, parents=True)
-    
+
     @classmethod
     def from_file(cls, config_path: str) -> 'Config':
-        """Load configuration from JSON file"""
+        """Load configuration from a JSON file.
+
+        Parameters
+        ----------
+        config_path : str
+            Path to the JSON configuration file.
+
+        Returns
+        -------
+        Config
+            A new Config instance with values loaded from the file.
+
+        Raises
+        ------
+        FileNotFoundError
+            If the config file doesn't exist.
+        json.JSONDecodeError
+            If the file contains invalid JSON.
+        """
         with open(config_path, 'r') as f:
             config_dict = json.load(f)
         return cls(**config_dict)
 
     def to_file(self, config_path: str):
-        """Save configuration to JSON file"""
+        """Save configuration to a JSON file.
+
+        Parameters
+        ----------
+        config_path : str
+            Path where the configuration file will be saved.
+
+        Notes
+        -----
+        Path objects are automatically converted to strings for JSON serialization.
+        """
         config_dict = asdict(self)
         # Convert Path objects to strings
         for key, value in config_dict.items():
@@ -104,10 +350,35 @@ class Config:
 
 
 class RandomSeedManager:
-    """Manages random seed setting across all libraries"""
+    """Manages random seed setting across all libraries for reproducibility.
+
+    This class ensures deterministic behavior across numpy, PyTorch, and Python's
+    random module. Critical for reproducible machine learning experiments.
+
+    Example
+    -------
+    >>> RandomSeedManager.set_seeds(42)
+    >>> # All subsequent random operations will be deterministic
+    """
 
     @staticmethod
     def set_seeds(seed: int):
+        """Set random seeds across all libraries.
+
+        Parameters
+        ----------
+        seed : int
+            The seed value to use for all random number generators.
+
+        Notes
+        -----
+        Sets seeds for:
+        - Python's random module
+        - NumPy
+        - PyTorch (CPU and all CUDA devices)
+        - PYTHONHASHSEED environment variable
+        - cuDNN deterministic mode
+        """
         random.seed(seed)
         np.random.seed(seed)
         torch.manual_seed(seed)
@@ -586,22 +857,57 @@ class MLPipeline:
         # Initialize meta_results and fitted_meta_learners
         meta_results = {}
         fitted_meta_learners = {}
+        meta_cv_type = None  # Will be set if ensemble is created
 
         # Create ensemble if we have enough models
         if len(selected) >= 2:
             # Stack predictions
             stack_train = np.column_stack([item['oof_preds'] for item in selected])
 
-            # Train meta-learners (using regular k-fold for meta-learners to save computation)
+            # Train meta-learners using same CV strategy as base models
             meta_learners = ModelFactory.create_meta_learners(self.config.random_seed)
-            meta_cv = StratifiedKFold(n_splits=min(5, len(y_train)), shuffle=True,
-                                      random_state=self.config.random_seed)
+
+            # Determine CV strategy for meta-learners (match base model CV)
+            use_loo_for_meta = self.config.use_loo_cv and len(y_train) <= self.config.loo_max_samples
+            meta_cv_type = 'LOO' if use_loo_for_meta else f'{min(5, len(y_train))}-fold'
+
+            if use_loo_for_meta:
+                logging.info("Using LOO CV for meta-learners (consistent with base models)")
+            else:
+                logging.info(f"Using {min(5, len(y_train))}-fold CV for meta-learners")
 
             for name, learner in meta_learners.items():
                 try:
-                    learner.fit(stack_train, y_train)
-                    meta_preds = cross_val_predict(learner, stack_train, y_train,
-                                                   cv=meta_cv, method='predict_proba')[:, 1]
+                    if use_loo_for_meta:
+                        # LOO CV for meta-learners
+                        n_samples = len(y_train)
+                        meta_preds = np.zeros(n_samples)
+                        loo = LeaveOneOut()
+
+                        logging.info(f"Running LOO CV for meta-learner {name} ({n_samples} iterations)...")
+                        for i, (train_idx, val_idx) in enumerate(loo.split(stack_train)):
+                            if i % 50 == 0:
+                                logging.info(f"  LOO iteration {i}/{n_samples}")
+
+                            # Train on N-1, predict on 1
+                            fold_learner = deepcopy(learner)
+                            fold_learner.fit(stack_train[train_idx], y_train.iloc[train_idx])
+                            meta_preds[val_idx[0]] = fold_learner.predict_proba(stack_train[val_idx])[:, 1][0]
+
+                        # Fit final meta-learner on all data for test set evaluation
+                        learner.fit(stack_train, y_train)
+                    else:
+                        # k-fold CV for meta-learners
+                        meta_cv = StratifiedKFold(n_splits=min(5, len(y_train)), shuffle=True,
+                                                  random_state=self.config.random_seed)
+
+                        # Get OOF predictions via proper CV (train on fold, predict on held-out)
+                        meta_preds = cross_val_predict(learner, stack_train, y_train,
+                                                       cv=meta_cv, method='predict_proba')[:, 1]
+
+                        # Fit final meta-learner on all data for test set evaluation
+                        learner.fit(stack_train, y_train)
+
                     meta_metrics = MetricsCalculator.calculate_metrics(y_train, meta_preds)
                     meta_results[name] = {
                         'model': learner,
@@ -616,10 +922,10 @@ class MLPipeline:
                         predictions=meta_preds,
                         y_true=y_train,
                         indices=self.data_loader.train_indices,
-                        cv_type='k-fold'
+                        cv_type=meta_cv_type
                     )
 
-                    logging.info(f"Meta-learner {name}: AUC = {meta_metrics['auc']:.4f}")
+                    logging.info(f"Meta-learner {name}: AUC = {meta_metrics['auc']:.4f} ({meta_cv_type} CV)")
                 except Exception as e:
                     logging.error(f"Meta-learner {name} failed: {e}")
 
@@ -726,6 +1032,108 @@ class MLPipeline:
                 except Exception as e:
                     logging.error(f"Test evaluation failed for SE_{name}: {e}")
 
+        # REFIT ON ALL DATA FOR DEPLOYMENT (if enabled)
+        deployment_models = []
+        deployment_meta_learners = {}
+        deployment_imputer = None
+
+        if self.config.refit_final_on_all_data:
+            logging.info("\n" + "=" * 60)
+            logging.info("REFITTING MODELS ON ALL DATA FOR DEPLOYMENT")
+            logging.info("=" * 60)
+            logging.info("Note: Test metrics above are from models trained on training set only.")
+            logging.info("Deployment models below are trained on 100% of data (train + test).")
+
+            # Combine train and test data
+            X_all = pd.concat([X_train, X_test], axis=0)
+            X_all_imputed = pd.concat([X_train_imputed, X_test_imputed], axis=0)
+            y_all = pd.concat([y_train, y_test], axis=0)
+
+            logging.info(f"Combined dataset: {len(y_all)} samples (train: {len(y_train)} + test: {len(y_test)})")
+
+            # Refit imputer on ALL data for deployment
+            deployment_imputer = SimpleImputer(strategy='mean')
+            X_all_imputed_new = pd.DataFrame(
+                deployment_imputer.fit_transform(X_all),
+                columns=X_all.columns,
+                index=X_all.index
+            )
+            logging.info("Refitted imputer on all data")
+
+            # Refit base models on all data
+            for model_name, model in trained_models:
+                try:
+                    # Use appropriate data
+                    if model_name in nan_native_models:
+                        X_use = X_all
+                    else:
+                        X_use = X_all_imputed_new
+
+                    # Create fresh model and fit on all data
+                    deployment_model = deepcopy(model)
+                    deployment_model.fit(X_use, y_all)
+                    deployment_models.append((model_name, deployment_model))
+                    logging.info(f"  ✅ {model_name}: refitted on all {len(y_all)} samples")
+
+                except Exception as e:
+                    logging.error(f"  ❌ Failed to refit {model_name}: {e}")
+
+            # Refit meta-learners on all data if we have enough models
+            if len(selected) >= 2 and fitted_meta_learners:
+                logging.info("\nRefitting meta-learners on all data...")
+
+                # Create stack of predictions from deployment models on all data
+                stack_all = np.zeros((len(y_all), len(selected)))
+
+                for i, item in enumerate(selected):
+                    sel_model_name = item['name']
+
+                    # Find the deployment model
+                    deploy_model = None
+                    for name, m in deployment_models:
+                        if name == sel_model_name:
+                            deploy_model = m
+                            break
+
+                    if deploy_model is None:
+                        logging.warning(f"Deployment model {sel_model_name} not found")
+                        stack_all[:, i] = 0.5
+                        continue
+
+                    # Use appropriate data
+                    if sel_model_name in nan_native_models:
+                        X_use = X_all
+                    else:
+                        X_use = X_all_imputed_new
+
+                    try:
+                        if hasattr(deploy_model, 'predict_proba'):
+                            stack_all[:, i] = deploy_model.predict_proba(X_use)[:, 1]
+                        else:
+                            scores = deploy_model.decision_function(X_use)
+                            stack_all[:, i] = (scores - scores.min()) / (scores.max() - scores.min())
+                    except Exception as e:
+                        logging.error(f"Failed to create stack for {sel_model_name}: {e}")
+                        stack_all[:, i] = 0.5
+
+                # Refit each meta-learner
+                for name in fitted_meta_learners.keys():
+                    try:
+                        # Create fresh meta-learner
+                        fresh_meta_learners = ModelFactory.create_meta_learners(self.config.random_seed)
+                        deploy_meta = fresh_meta_learners[name]
+                        deploy_meta.fit(stack_all, y_all)
+                        deployment_meta_learners[name] = deploy_meta
+                        logging.info(f"  ✅ SE_{name}: refitted on all {len(y_all)} samples")
+                    except Exception as e:
+                        logging.error(f"  ❌ Failed to refit SE_{name}: {e}")
+
+            logging.info("\n" + "=" * 60)
+            logging.info("DEPLOYMENT MODEL REFITTING COMPLETE")
+            logging.info(f"  Base models: {len(deployment_models)}")
+            logging.info(f"  Meta-learners: {len(deployment_meta_learners)}")
+            logging.info("=" * 60 + "\n")
+
         # SAVE ALL PREDICTIONS TO FILES
         logging.info("\n" + "=" * 60)
         logging.info("SAVING PREDICTIONS TO FILES")
@@ -755,7 +1163,7 @@ class MLPipeline:
                 'Model': f'SE_{name}',
                 'Mean ROC AUC': result['metrics']['auc'],
                 'Std': 0.0,
-                'CV Type': 'k-fold'
+                'CV Type': meta_cv_type if meta_cv_type else 'k-fold'
             }])], ignore_index=True)
 
         # Save summary
@@ -795,18 +1203,54 @@ class MLPipeline:
                 'oof_predictions': oof_predictions,
                 'test_predictions': test_predictions
             },
-            'saved_predictions': saved_prediction_files  # Add reference to saved files
+            'saved_predictions': saved_prediction_files,
+            # Deployment models (trained on ALL data) - only present if refit_final_on_all_data=True
+            'deployment_models': deployment_models if deployment_models else None,
+            'deployment_meta_learners': deployment_meta_learners if deployment_meta_learners else None,
+            'deployment_imputer': deployment_imputer,
+            'refit_on_all_data': self.config.refit_final_on_all_data
         }
 
-    def load_state(self, state: Dict[str, Any]):
-        """Load a saved training state into the pipeline"""
-        self.fitted_models = state.get('fitted_models', [])
-        self.fitted_meta_learners = state.get('fitted_meta_learners', {})
+    def load_state(self, state: Dict[str, Any], use_deployment_models: bool = True):
+        """Load a saved training state into the pipeline
+
+        Args:
+            state: Dictionary containing the saved training state
+            use_deployment_models: If True and deployment models exist (trained on 100% data),
+                                  use them for predictions. If False, use the evaluation models
+                                  (trained on 70% training data). Default: True
+        """
+        # Check if deployment models are available
+        has_deployment = (state.get('deployment_models') is not None and
+                         len(state.get('deployment_models', [])) > 0)
+
+        if use_deployment_models and has_deployment:
+            # Use deployment models (trained on ALL data)
+            self.fitted_models = state.get('deployment_models', [])
+            self.fitted_meta_learners = state.get('deployment_meta_learners', {})
+            self.using_deployment_models = True
+            logging.info("=" * 60)
+            logging.info("LOADING DEPLOYMENT MODELS (trained on 100% of data)")
+            logging.info("=" * 60)
+        else:
+            # Use evaluation models (trained on training set only)
+            self.fitted_models = state.get('fitted_models', [])
+            self.fitted_meta_learners = state.get('fitted_meta_learners', {})
+            self.using_deployment_models = False
+            if use_deployment_models and not has_deployment:
+                logging.warning("Deployment models not available - using evaluation models")
+                logging.warning("To get deployment models, retrain with refit_final_on_all_data=True")
+            logging.info("Loading evaluation models (trained on 70% training data)")
+
         self.selected_models = state.get('selected_models', [])
         self.selected_indices = state.get('selected_indices', [])
-        
-        # Load the imputer with proper fallback handling
-        if 'data_imputer' in state and state['data_imputer'] is not None:
+
+        # Load the appropriate imputer
+        if use_deployment_models and has_deployment and state.get('deployment_imputer') is not None:
+            self.data_loader.imputer = state['deployment_imputer']
+            self.data_loader.imputer_fitted = True
+            logging.info("Loaded deployment imputer (fitted on all data)")
+        elif 'data_imputer' in state and state['data_imputer'] is not None:
             self.data_loader.imputer = state['data_imputer']
             self.data_loader.imputer_fitted = True
             logging.info("Loaded fitted imputer")
@@ -821,15 +1265,19 @@ class MLPipeline:
             logging.error("This may lead to different results than during training!")
             self.data_loader.imputer = SimpleImputer(strategy='mean')
             self.data_loader.imputer_fitted = False  # Mark as not fitted
-            
+
         self.data_loader.scaler = state.get('meta_scaler', StandardScaler())
         self.model_summary = state.get('model_summary')
-        
+
         # Store the full state for reference
         self.state = state
-        
+
         logging.info(f"Loaded {len(self.fitted_models)} base models")
         logging.info(f"Loaded {len(self.fitted_meta_learners)} meta-learners")
+        if self.using_deployment_models:
+            logging.info("These models were trained on ALL available data (train + test)")
+        else:
+            logging.info("These models were trained on the training set only (for evaluation)")
 
     def predict(self, data_path: str, threshold: float = 0.5) -> pd.DataFrame:
         """Make predictions on new data using loaded models"""
@@ -845,7 +1293,7 @@ class MLPipeline:
         # Process features (same as training)
         X_new = df.drop(columns=['ALT', 'ID', 'ID_BUCKET', 'Achilles', 'order',
                              'StripCI', 'internalID', 'Source', 'SJUID', "PG_ATRX","TVR", "Lineage", "Age","DG","SMARCAL1","Adjusted Telomere Content","Human vs Mouse","TERT_exp2",
-                             "C-circle Content", "CC Status", "Common Mutations", "Diagnosis", 'ATRX_DAXX',
+                             "C-circle Content", "CC Stmake it so theatus", "Common Mutations", "Diagnosis", 'ATRX_DAXX',
                              "LoHFraction",   "WGD",   "CIN",   "Ploidy", "Aneuploidy","Sample_Name","LENGTH_ESTIMATE","Telomeric_Reads",
                              "TERRA_RPM" ,"Telomeric_Fraction", "Lineage", "Age","DG", "SMARCAL1_dep",  "MSI", "CIN2"], errors='ignore')
         
