@@ -21,3 +21,4 @@ catboost_info/
 results/
 test/results/
 test/fake_alt_input.tsv
+test/smoke_results/

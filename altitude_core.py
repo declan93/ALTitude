@@ -193,7 +193,7 @@ class Config:
     Attributes
     ----------
 
-    random_seed : int, default=32ac
+    random_seed : int, default=32
         Random seed for reproducibility across all libraries (numpy, torch, sklearn).
 
     test_size : float, default=0.3
@@ -1060,8 +1060,21 @@ class MLPipeline:
             )
             logging.info("Refitted imputer on all data")
 
-            # Refit base models on all data
+            # Refit base models on all data. Ensemble members go through
+            # ModelTrainer so they also return out-of-fold predictions on all
+            # data, which the deployment meta-learners are trained on (as the
+            # evaluated meta-learners were).
+            trained_by_name = dict(trained_models)
+            ensemble_members = [(item['name'], trained_by_name[item['name']])
+                                for item in selected if item['name'] in trained_by_name]
+            stack_all, refitted_members = self._deployment_oof_stack(
+                ensemble_members, X_all, X_all_imputed_new, y_all)
+            refitted_members = dict(refitted_members)
+
             for model_name, model in trained_models:
+                if model_name in refitted_members:
+                    deployment_models.append((model_name, refitted_members[model_name]))
+                    continue
                 try:
                     # Use appropriate data
                     if model_name in nan_native_models:
@@ -1080,41 +1093,7 @@ class MLPipeline:
 
             # Refit meta-learners on all data if we have enough models
             if len(selected) >= 2 and fitted_meta_learners:
-                logging.info("\nRefitting meta-learners on all data...")
-
-                # Create stack of predictions from deployment models on all data
-                stack_all = np.zeros((len(y_all), len(selected)))
-
-                for i, item in enumerate(selected):
-                    sel_model_name = item['name']
-
-                    # Find the deployment model
-                    deploy_model = None
-                    for name, m in deployment_models:
-                        if name == sel_model_name:
-                            deploy_model = m
-                            break
-
-                    if deploy_model is None:
-                        logging.warning(f"Deployment model {sel_model_name} not found")
-                        stack_all[:, i] = 0.5
-                        continue
-
-                    # Use appropriate data
-                    if sel_model_name in nan_native_models:
-                        X_use = X_all
-                    else:
-                        X_use = X_all_imputed_new
-
-                    try:
-                        if hasattr(deploy_model, 'predict_proba'):
-                            stack_all[:, i] = deploy_model.predict_proba(X_use)[:, 1]
-                        else:
-                            scores = deploy_model.decision_function(X_use)
-                            stack_all[:, i] = (scores - scores.min()) / (scores.max() - scores.min())
-                    except Exception as e:
-                        logging.error(f"Failed to create stack for {sel_model_name}: {e}")
-                        stack_all[:, i] = 0.5
+                logging.info("\nRefitting meta-learners on out-of-fold predictions from all data...")
 
                 # Refit each meta-learner
                 for name in fitted_meta_learners.keys():
@@ -1211,6 +1190,35 @@ class MLPipeline:
             'refit_on_all_data': self.config.refit_final_on_all_data
         }
 
+    def _deployment_oof_stack(self, models: List[Tuple[str, Any]], X_all: pd.DataFrame,
+                              X_all_imputed: pd.DataFrame, y_all: pd.Series):
+        """Refit ensemble members on all data and return their out-of-fold predictions.
+
+        Uses the same CV strategy as training (ModelTrainer), so the deployment
+        meta-learners are trained on OOF predictions, like the evaluated
+        meta-learners, rather than on predictions from models fitted on the same
+        samples.
+
+        Returns:
+            stack: array (n_samples, n_models), columns in the order of `models`
+                (0.5 for a model that failed to refit)
+            refitted: list of (name, model fitted on all data)
+        """
+        stack = np.full((len(y_all), len(models)), 0.5)
+        refitted = []
+
+        for i, (model_name, model) in enumerate(models):
+            result = self.trainer.train_model(model, model_name, X_all, X_all_imputed, y_all)
+            if not result['success']:
+                logging.error(f"  ❌ Failed to refit {model_name}; its stack column is set to 0.5")
+                continue
+            stack[:, i] = result['oof_preds']
+            refitted.append((model_name, result['model']))
+            logging.info(f"  ✅ {model_name}: refitted on all {len(y_all)} samples "
+                         f"({result['cv_type']} OOF AUC = {result['metrics']['auc']:.4f})")
+
+        return stack, refitted
+
     def load_state(self, state: Dict[str, Any], use_deployment_models: bool = True):
         """Load a saved training state into the pipeline
 
@@ -1293,7 +1301,7 @@ class MLPipeline:
         # Process features (same as training)
         X_new = df.drop(columns=['ALT', 'ID', 'ID_BUCKET', 'Achilles', 'order',
                              'StripCI', 'internalID', 'Source', 'SJUID', "PG_ATRX","TVR", "Lineage", "Age","DG","SMARCAL1","Adjusted Telomere Content","Human vs Mouse","TERT_exp2",
-                             "C-circle Content", "CC Stmake it so theatus", "Common Mutations", "Diagnosis", 'ATRX_DAXX',
+                             "C-circle Content", "CC Status", "Common Mutations", "Diagnosis", 'ATRX_DAXX',
                              "LoHFraction",   "WGD",   "CIN",   "Ploidy", "Aneuploidy","Sample_Name","LENGTH_ESTIMATE","Telomeric_Reads",
                              "TERRA_RPM" ,"Telomeric_Fraction", "Lineage", "Age","DG", "SMARCAL1_dep",  "MSI", "CIN2"], errors='ignore')
         
