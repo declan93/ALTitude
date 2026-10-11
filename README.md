@@ -50,11 +50,15 @@ ALTtitude is a robust machine learning pipeline for predicting **Alternative Len
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/ALTtitude.git
-cd ALTtitude
+git clone https://github.com/declan93/ALTitude.git
+cd ALTitude
 
-# Install required packages
-pip install numpy pandas scikit-learn xgboost lightgbm catboost torch matplotlib seaborn
+# Create the conda environment (recommended — pins all tested versions)
+conda env create -f environment.yml
+conda activate ALT
+
+# Or install manually with pip
+pip install numpy pandas scikit-learn xgboost lightgbm catboost torch matplotlib seaborn tabpfn-extensions
 
 # Optional: Install SHAP for feature interpretation
 pip install shap
@@ -71,6 +75,7 @@ pip install shap
 | lightgbm | ≥3.0.0 | Light gradient boosting |
 | catboost | ≥0.24.0 | Categorical boosting |
 | torch | ≥1.7.0 | TabPFN meta-learner |
+| tabpfn-extensions | — | TabPFN classifier |
 | matplotlib | ≥3.2.0 | Visualization |
 | seaborn | ≥0.11.0 | Statistical plots |
 | shap | ≥0.39.0 | Feature interpretation (optional) |
@@ -80,8 +85,8 @@ pip install shap
 ## Quick Start
 
 ```bash
-# Train a model
-python ALTitude_cli.py train your_data.tsv
+# Train a model (include --refit-all-data to enable predictions on new samples)
+python ALTitude_cli.py train your_data.tsv --refit-all-data
 
 # Make predictions on new samples
 python ALTitude_cli.py predict new_samples.tsv --model-dir ./results/
@@ -89,6 +94,9 @@ python ALTitude_cli.py predict new_samples.tsv --model-dir ./results/
 # View model performance
 python ALTitude_cli.py evaluate --model-dir ./results/
 ```
+
+> **Warning: `--refit-all-data` is required for prediction.**
+> The `predict` command loads deployment models by default. These are only created when you train with `--refit-all-data`. If you train without this flag, `predict` will either (a) load stale deployment files from a previous run (if they still exist in the output directory), or (b) fall back to evaluation models trained on only 70% of the data. To avoid version-mismatch errors or silently using outdated models, always train with `--refit-all-data` before running `predict`.
 
 ---
 
@@ -123,7 +131,7 @@ ALTtitude uses a sophisticated **ensemble stacking** approach that combines mult
 │  └── HistGradientBoosting    │                                  │
 ├─────────────────────────────────────────────────────────────────┤
 │  Linear/Other                │  Meta-Learning                   │
-│  ├── Logistic Regression     │  ├── TabPFN (optional)           │
+│  ├── Logistic Regression     │  ├── TabPFN                      │
 │  └── Linear SVC              │  └── Naive Bayes                 │
 └─────────────────────────────────────────────────────────────────┘
                                 │
@@ -197,6 +205,36 @@ ALTtitude uses a sophisticated **ensemble stacking** approach that combines mult
    - Find optimal decision boundary
    - Multiple optimization strategies available
 
+### Deployment vs Evaluation Models
+
+When using `--refit-all-data`, ALTitude creates two separate sets of models:
+
+| Model Type | Training Data | Purpose |
+|------------|---------------|---------|
+| **Evaluation Models** | Training set only (70%) | Used for test set metrics and reported performance |
+| **Deployment Models** | ALL data (100%) | Used for predictions on new, unseen samples |
+
+**Why this separation?**
+
+- **Evaluation models** provide unbiased performance metrics since they never see the test set during training
+- **Deployment models** maximize predictive power by learning from all available labeled data
+- Deployment meta-learners are trained on out-of-fold predictions of the refitted base models (same CV strategy as training), so the deployed stacking ensemble is built the same way as the evaluated one
+- This is the recommended approach for production use when you have a fixed training dataset
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    WITHOUT --refit-all-data                     │
+│  Training Data (70%) ──► Models ──► Test Evaluation (30%)       │
+│                              └────► Predictions on new data     │
+└─────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────┐
+│                    WITH --refit-all-data                        │
+│  Training Data (70%) ──► Eval Models ──► Test Metrics (30%)     │
+│  ALL Data (100%) ────► Deploy Models ──► Predictions on new data│
+└─────────────────────────────────────────────────────────────────┘
+```
+
 ### Evaluation Metrics
 
 | Metric | Description |
@@ -254,6 +292,7 @@ python ALTitude_cli.py train data/training_data.tsv \
 | `--min-specificity` | `None` | Minimum required specificity |
 | `--analyze-thresholds` | `False` | Generate threshold analysis plots |
 | `--no-plots` | `False` | Skip visualization generation |
+| `--refit-all-data` | `False` | Refit models on ALL data (train+test) for deployment |
 
 #### Threshold Optimization Strategies
 
@@ -267,8 +306,10 @@ python ALTitude_cli.py train data/training_data.tsv \
 
 ### Prediction
 
+> **Warning:** `predict` loads deployment models when they exist in the model directory. You **must** train with `--refit-all-data` to generate these files. If deployment files are absent, `predict` falls back to evaluation-only models (trained on 70% of data). If stale deployment files remain from a prior training run, `predict` will load those instead of freshly trained models — delete old `deployment_*.pkl` files or re-run training with `--refit-all-data` to avoid this.
+
 ```bash
-# Basic prediction
+# Basic prediction (requires prior training with --refit-all-data)
 python ALTitude_cli.py predict data/new_samples.tsv --model-dir ./results/
 
 # With custom threshold
@@ -368,6 +409,11 @@ results/
 ├── model_summary_report.txt       # Human-readable summary
 ├── optimal_thresholds.json        # Optimized thresholds per model
 ├── class_distribution.json        # Class balance statistics
+├── base_models.pkl                # Evaluation models (trained on 70%)
+├── meta_learners.pkl              # Evaluation meta-learners
+├── deployment_models.pkl          # Deployment models (trained on 100%, if --refit-all-data)
+├── deployment_meta_learners.pkl   # Deployment meta-learners (if --refit-all-data)
+├── deployment_imputer.pkl         # Imputer for deployment (if --refit-all-data)
 │
 ├── training_results/
 │   ├── training_report_*.txt      # Detailed training report
@@ -420,14 +466,15 @@ config = Config(
     output_dir='./results',
     random_seed=42,
     test_size=0.3,
-    cv_folds=5
+    cv_folds=5,
+    refit_final_on_all_data=True  # Create deployment models trained on 100% data
 )
 
 # Train models
 pipeline = MLPipeline(config)
 results = pipeline.train()
 
-# Save trained models
+# Save trained models (includes both evaluation and deployment models)
 model_manager = ModelManager('./results')
 model_manager.save_training_state(
     fitted_models=results['fitted_models'],
@@ -438,10 +485,14 @@ model_manager.save_training_state(
     selected_models=results['selected_models'],
     selected_indices=results['selected_indices'],
     config=config,
-    model_summary=results['summary']
+    model_summary=results['summary'],
+    # Deployment models (trained on ALL data)
+    deployment_models=results.get('deployment_models'),
+    deployment_meta_learners=results.get('deployment_meta_learners'),
+    deployment_imputer=results.get('deployment_imputer')
 )
 
-# Load and predict on new data
+# Load and predict on new data (uses deployment models automatically)
 state = model_manager.load_training_state()
 pipeline.load_state(state)
 predictions = pipeline.predict('new_data.tsv', threshold=0.5)
@@ -470,8 +521,8 @@ predictions.to_csv('predictions.csv', index=False)
 ### Example 1: Basic Training and Prediction
 
 ```bash
-# Train on your dataset
-python ALTitude_cli.py train my_cancer_samples.tsv --output-dir ./alt_model
+# Train on your dataset (--refit-all-data is required for predict to work correctly)
+python ALTitude_cli.py train my_cancer_samples.tsv --refit-all-data --output-dir ./alt_model
 
 # Predict on new samples
 python ALTitude_cli.py predict new_samples.tsv \
@@ -479,7 +530,7 @@ python ALTitude_cli.py predict new_samples.tsv \
     --output-file predictions.csv
 ```
 
-### Example 2: Optimized for Increased Sensitivity
+### Example 2: Optimized for Clinical Use
 
 ```bash
 # Train with high sensitivity (minimize missed ALT cases)
@@ -501,7 +552,27 @@ python ALTitude_cli.py train small_dataset.tsv \
     --output-dir ./small_model
 ```
 
-### Example 4: Complete Research Pipeline
+### Example 4: Production Deployment with Full Data Refitting
+
+```bash
+# Train with deployment models (uses ALL data for final models)
+python ALTitude_cli.py train training_data.tsv \
+    --refit-all-data \
+    --optimize-threshold \
+    --threshold-metric alt_focused \
+    --output-dir ./production_model
+
+# Predictions automatically use deployment models when available
+python ALTitude_cli.py predict new_samples.tsv \
+    --model-dir ./production_model \
+    --output-file predictions.csv
+```
+
+This creates:
+- **Evaluation models** (70% data) for unbiased performance metrics
+- **Deployment models** (100% data) for maximum predictive power on new samples
+
+### Example 5: Complete Research Pipeline
 
 ```python
 from altitude_core import MLPipeline, Config
@@ -559,12 +630,19 @@ python ALTitude_cli.py train test/fake_alt_input.tsv --output-dir ./test/results
 
 Because the injected class signal is strong by design, base models recover it almost perfectly (LOO-CV AUC ≈ 1.0). Use this dataset to verify that the pipeline runs end-to-end and to inspect output structure — it is not a substitute for evaluation on real data, since the synthetic features lack the correlation structure and noise of biological samples.
 
+Check the deployment path end to end (train with `--refit-all-data`, then predict) and that the deployment meta-learners are trained on out-of-fold predictions:
+
+```bash
+bash test/smoke_test.sh
+python test/test_deployment_stacking.py
+```
+
 ---
 
 ## File Structure
 
 ```
-ALTtitude/
+ALTitude/
 ├── ALTitude_cli.py                # Command-line interface
 ├── altitude_core.py               # Main ML pipeline
 ├── altitude_model_manager.py      # Model persistence
@@ -574,25 +652,28 @@ ALTtitude/
 ├── altitude_results_logger.py     # Results logging
 ├── altitude_prediction_logger.py  # Prediction logging
 ├── simple_visualizer.py           # Visualization
+├── extract_importances_cli.py     # Feature importances from a saved model
 ├── README.md                      # This file
-├── requirements.txt               # Dependencies
+├── environment.yml                # Conda environment (pinned versions)
 └── test/
     ├── test_data.txt              # Synthetic 100-sample input (WDL schema)
-    └── prepare_fake_data.py       # Attaches reproducible ALT labels, writes TSV
+    ├── prepare_fake_data.py       # Attaches reproducible ALT labels, writes TSV
+    ├── smoke_test.sh              # Train --refit-all-data + predict end to end
+    └── test_deployment_stacking.py # Deployment meta-learners use OOF predictions
 ```
 
 ---
 
 ## Citation
 
-If you use ALTtitude in your research, please cite:
+If you use ALTitude in your research, please cite it as in [CITATION.cff](CITATION.cff):
 
 ```bibtex
 @software{altitude2024,
-  title={Title},
-  author={[Author Names]},
-  year={},
-  url={https://github.com/yourusername/ALTtitude}
+  title={ALTtitude: A Machine Learning Pipeline for Predicting Alternative Lengthening of Telomeres},
+  author={Bennett, Declan},
+  year={2026},
+  url={https://github.com/declan93/ALTitude}
 }
 ```
 
@@ -600,7 +681,7 @@ If you use ALTtitude in your research, please cite:
 
 ## License
 
-This project is licensed under the MIT License — see the [LICENSE](LICENSE) file for details.
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
 ---
 
@@ -613,6 +694,3 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 3. Commit your changes (`git commit -m 'Add some AmazingFeature'`)
 4. Push to the branch (`git push origin feature/AmazingFeature`)
 5. Open a Pull Request
-
----
-

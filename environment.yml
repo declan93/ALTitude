@@ -1,0 +1,28 @@
+# ALTitude python environment
+#
+#   conda env create -f environment.yml
+#   conda activate ALT
+#
+# Versions pinned to the environment used for the published results
+# (captured 2026-10-06). tabpfn and tabpfn_extensions come from pip.
+name: ALT
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12.2
+  - pandas=2.3.3
+  - numpy=2.4.4
+  - scipy=1.17.1
+  - scikit-learn=1.6.1
+  - matplotlib=3.10.8
+  - seaborn=0.12.2
+  - xgboost=3.0.4
+  - lightgbm=4.6.0
+  - openpyxl=3.1.5
+  - pip
+  - pip:
+      - catboost==1.2.8
+      - torch==2.7.1
+      - tabpfn==2.1.0
+      - tabpfn_extensions==0.1.1
+      - mlxtend==0.24.0
